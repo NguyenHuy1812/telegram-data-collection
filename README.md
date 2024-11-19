@@ -26,6 +26,20 @@ cp .env.example .env
    - Your API ID from my.telegram.org
    - Your API hash from my.telegram.org
 
+## Configuration
+
+Add your whitelisted channels to the `.env` file:
+
+```env
+TELEGRAM_CHANNEL_WHITELIST=@testchannelcollect,123456789
+```
+
+You can specify channels using either:
+- Channel usernames (starting with @)
+- Numeric channel IDs
+
+The application will automatically resolve usernames to channel IDs during startup.
+
 ## Running the Application
 
 1. Start the application:

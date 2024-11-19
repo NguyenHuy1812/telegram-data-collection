@@ -178,7 +178,7 @@ func (s PeerStorage) Assign(ctx context.Context, key string, value storage.Peer)
 
 // Resolve finds peer using associated key.
 func (s PeerStorage) Resolve(ctx context.Context, key string) (_ storage.Peer, rerr error) {
-	// Create database snapshot.
+	// Create config snapshot.
 	snap := s.pebble.NewSnapshot()
 	defer func() {
 		multierr.AppendInto(&rerr, snap.Close())
