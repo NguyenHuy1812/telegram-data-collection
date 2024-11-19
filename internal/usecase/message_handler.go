@@ -156,7 +156,7 @@ func (h *MessageHandler) HandleChannelMessage(ctx context.Context, e tg.Entities
 			return &mediaType
 		}(),
 	}
-	fmt.Println(message)
+	
 	// Get chatID
 	chatID := message.ChatID
 
