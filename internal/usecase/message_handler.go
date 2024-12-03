@@ -28,10 +28,21 @@ import (
 )
 
 const (
-	batchSize      = 1000
+	batchSize      = 10
 	bucketName     = "dwarvesf-telegram"
 	basePath       = "messages"
+	mediaPath      = "media"
 )
+
+type MediaInfo struct {
+	Type     string
+	MimeType string
+	Size     int64
+	Raw      []byte    // Raw media data
+	FileID   string    // Telegram's file ID
+	FileRef  []byte    // Telegram's file reference
+	Path     string    // Add this field
+}
 
 type MessageHandler struct {
 	baseURL      string
@@ -97,6 +108,16 @@ func (h *MessageHandler) HandleChannelMessage(ctx context.Context, e tg.Entities
 		return nil
 	}
 
+	// Handle media download before creating the message model
+	var mediaInfo *MediaInfo
+	if msg.Media != nil {
+		var err error
+		mediaInfo, err = h.handleMedia(ctx, msg)
+		if err != nil {
+			log.Printf("WARNING: Failed to handle media for message %d: %v", msg.ID, err)
+		}
+	}
+
 	// Create message model
 	message := &model.Message{
 		ChatID:    msg.GetPeerID().(*tg.PeerChannel).ChannelID,
@@ -155,12 +176,80 @@ func (h *MessageHandler) HandleChannelMessage(ctx context.Context, e tg.Entities
 			mediaType := getMediaType(msg.Media)
 			return &mediaType
 		}(),
+		EditDate: func() *int32 {
+			if msg.EditDate != 0 {
+				edit := int32(msg.EditDate)
+				return &edit
+			}
+			return nil
+		}(),
+		PostAuthor: func() *string {
+			if msg.PostAuthor != "" {
+				return &msg.PostAuthor
+			}
+			return nil
+		}(),
+		GroupedID: func() *int64 {
+			if msg.GroupedID != 0 {
+				id := int64(msg.GroupedID)
+				return &id
+			}
+			return nil
+		}(),
+		HasReactions: msg.Reactions.Results != nil,
+		ReactionCount: func() *int32 {
+			if reactions := msg.Reactions.Results; reactions != nil {
+				count := int32(len(reactions))
+				return &count
+			}
+			return nil
+		}(),
+		TTLPeriod: func() *int32 {
+			if msg.TTLPeriod != 0 {
+				ttl := int32(msg.TTLPeriod)
+				return &ttl
+			}
+			return nil
+		}(),
+		MediaPath: func() *string {
+			if mediaInfo != nil {
+				return &mediaInfo.Path
+			}
+			return nil
+		}(),
+		MediaSize: func() *int64 {
+			if mediaInfo != nil {
+				return &mediaInfo.Size
+			}
+			return nil
+		}(),
 	}
-	
+	// Print all message fields for debugging
+	log.Printf("Message details:")
+	log.Printf("ID: %d", msg.ID)
+	log.Printf("Message: %s", msg.Message) 
+	log.Printf("Date: %d", msg.Date)
+	log.Printf("FromID: %+v", msg.FromID)
+	log.Printf("PeerID: %+v", msg.GetPeerID())
+	log.Printf("Views: %d", msg.Views)
+	log.Printf("Forwards: %d", msg.Forwards)
+	log.Printf("Replies: %+v", msg.Replies)
+	log.Printf("Media: %+v", msg.Media)
+	log.Printf("ReplyTo: %+v", msg.ReplyTo)
+	log.Printf("Entities: %+v", msg.Entities)
+	log.Printf("Edit Date: %d", msg.EditDate)
+	log.Printf("Post Author: %s", msg.PostAuthor)
+	log.Printf("Grouped ID: %d", msg.GroupedID)
+	log.Printf("Reactions: %+v", msg.Reactions)
+	log.Printf("Restriction Reason: %+v", msg.RestrictionReason)
+	log.Printf("TTL Period: %d", msg.TTLPeriod)
+	log.Printf("Media Path: %v", message.MediaPath)
+	log.Printf("Media Size: %d", message.MediaSize)
 	// Get chatID
 	chatID := message.ChatID
 
-	currentDate := time.Now().Truncate(24 * time.Hour)
+	// Use message date instead of current time
+	messageDate := message.CreatedAt.Truncate(24 * time.Hour)
 	needsSave := false
 	isEndOfDay := false
 
@@ -168,36 +257,51 @@ func (h *MessageHandler) HandleChannelMessage(ctx context.Context, e tg.Entities
 	if h.batchMap[chatID] == nil {
 		h.batchMap[chatID] = make([]*model.Message, 0, batchSize)
 	}
-	h.batchMap[chatID] = append(h.batchMap[chatID], message)
-	
-	// Check if batch size reached
-	if len(h.batchMap[chatID]) >= batchSize {
-		needsSave = true
-	} else if !currentDate.Equal(h.lastSaveDate) {
-		// If we've crossed into a new day
-		if len(h.batchMap[chatID]) > 0 {
+
+	// Check if this message is from a different day than existing messages in batch
+	if len(h.batchMap[chatID]) > 0 {
+		existingMsgDate := h.batchMap[chatID][0].CreatedAt.Truncate(24 * time.Hour)
+		if !messageDate.Equal(existingMsgDate) {
+			// Save existing batch before adding new message from different day
 			needsSave = true
 			isEndOfDay = true
 		}
 	}
 
+	// If we need to save due to day change, do it before adding new message
 	var batch []*model.Message
 	if needsSave {
 		batch = h.batchMap[chatID]
 		h.batchMap[chatID] = make([]*model.Message, 0, batchSize) // Reset the batch
-		
-		// Only update lastSaveDate if this is an end-of-day save
 		if isEndOfDay {
-			h.lastSaveDate = currentDate
+			h.lastSaveDate = messageDate
 		}
 	}
 	h.batchMutex.Unlock()
 
-	// Save the batch if needed
+	// Save the batch if needed before adding new message
 	if needsSave {
-		// Use the date of the messages in the batch for the filename
-		batchDate := batch[0].CreatedAt.Truncate(24 * time.Hour)
-		if err := h.saveBatch(ctx, chatID, batch, batchDate); err != nil {
+		if err := h.saveBatch(ctx, chatID, batch, batch[0].CreatedAt.Truncate(24 * time.Hour)); err != nil {
+			return fmt.Errorf("failed to save batch for channel %d: %w", chatID, err)
+		}
+	}
+
+	// Now add the new message to the fresh batch
+	h.batchMutex.Lock()
+	h.batchMap[chatID] = append(h.batchMap[chatID], message)
+	
+	// Check if batch size reached
+	needsSave = false
+	if len(h.batchMap[chatID]) >= batchSize {
+		batch = h.batchMap[chatID]
+		h.batchMap[chatID] = make([]*model.Message, 0, batchSize)
+		needsSave = true
+	}
+	h.batchMutex.Unlock()
+
+	// Save if batch size reached
+	if needsSave {
+		if err := h.saveBatch(ctx, chatID, batch, messageDate); err != nil {
 			return fmt.Errorf("failed to save batch for channel %d: %w", chatID, err)
 		}
 	}
@@ -351,6 +455,50 @@ func writeMessageToParquet(w *pwriter.FileWriter, msg *model.Message) error {
 		bldr.Field(13).(*array.StringBuilder).AppendNull()
 	}
 
+	if msg.EditDate != nil {
+		bldr.Field(14).(*array.Int32Builder).Append(*msg.EditDate)
+	} else {
+		bldr.Field(14).(*array.Int32Builder).AppendNull()
+	}
+
+	if msg.PostAuthor != nil {
+		bldr.Field(15).(*array.StringBuilder).Append(*msg.PostAuthor)
+	} else {
+		bldr.Field(15).(*array.StringBuilder).AppendNull()
+	}
+
+	if msg.GroupedID != nil {
+		bldr.Field(16).(*array.Int64Builder).Append(*msg.GroupedID)
+	} else {
+		bldr.Field(16).(*array.Int64Builder).AppendNull()
+	}
+
+	bldr.Field(17).(*array.BooleanBuilder).Append(msg.HasReactions)
+
+	if msg.ReactionCount != nil {
+		bldr.Field(18).(*array.Int32Builder).Append(*msg.ReactionCount)
+	} else {
+		bldr.Field(18).(*array.Int32Builder).AppendNull()
+	}
+
+	if msg.TTLPeriod != nil {
+		bldr.Field(19).(*array.Int32Builder).Append(*msg.TTLPeriod)
+	} else {
+		bldr.Field(19).(*array.Int32Builder).AppendNull()
+	}
+
+	if msg.MediaPath != nil {
+		bldr.Field(20).(*array.StringBuilder).Append(*msg.MediaPath)
+	} else {
+		bldr.Field(20).(*array.StringBuilder).AppendNull()
+	}
+
+	if msg.MediaSize != nil {
+		bldr.Field(21).(*array.Int64Builder).Append(*msg.MediaSize)
+	} else {
+		bldr.Field(21).(*array.Int64Builder).AppendNull()
+	}
+
 	record := bldr.NewRecord()
 	defer record.Release()
 
@@ -378,6 +526,14 @@ func createMessageSchema() *arrow.Schema {
 			{Name: "Replies", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
 			{Name: "HasMedia", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 			{Name: "MediaType", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "EditDate", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			{Name: "PostAuthor", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "GroupedID", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+			{Name: "HasReactions", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+			{Name: "ReactionCount", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			{Name: "TTLPeriod", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			{Name: "MediaPath", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "MediaSize", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
 		},
 		nil, // metadata
 	)
@@ -520,4 +676,103 @@ func (h *MessageHandler) getNextChunkNumberForChannelAndDate(chatID int64, date 
 	}
 
 	return maxChunk + 1, nil
+}
+
+func (h *MessageHandler) handleMedia(ctx context.Context, msg *tg.Message) (*MediaInfo, error) {
+	switch media := msg.Media.(type) {
+	case *tg.MessageMediaPhoto:
+		return h.handlePhotoMetadata(media)
+	case *tg.MessageMediaDocument:
+		return h.handleDocumentMetadata(media)
+	default:
+		return nil, fmt.Errorf("unsupported media type: %T", media)
+	}
+}
+
+func (h *MessageHandler) handlePhotoMetadata(photo *tg.MessageMediaPhoto) (*MediaInfo, error) {
+	p, ok := photo.Photo.(*tg.Photo)
+	if !ok {
+		return nil, fmt.Errorf("invalid photo type")
+	}
+
+	// Get the largest photo size
+	var largest *tg.PhotoSize
+	for _, size := range p.Sizes {
+		if photoSize, ok := size.(*tg.PhotoSize); ok {
+			if largest == nil || photoSize.Size > largest.Size {
+				largest = photoSize
+			}
+		}
+	}
+
+	if largest == nil {
+		return nil, fmt.Errorf("no valid photo size found")
+	}
+
+	return &MediaInfo{
+		Type:     "photo",
+		MimeType: "image/jpeg", // Photos are typically JPEG
+		Size:     int64(largest.Size),
+		FileID:   strconv.FormatInt(p.ID, 10), // Convert int64 to string
+		FileRef:  p.FileReference,
+		Path:     fmt.Sprintf("photos/%d.jpg", p.ID), // Add a path
+	}, nil
+}
+
+func (h *MessageHandler) handleDocumentMetadata(doc *tg.MessageMediaDocument) (*MediaInfo, error) {
+	document, ok := doc.Document.(*tg.Document)
+	if !ok {
+		return nil, fmt.Errorf("invalid document type")
+	}
+
+	// Get original filename if available
+	filename := ""
+	for _, attr := range document.Attributes {
+		if fileAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+			filename = fileAttr.FileName
+			break
+		}
+	}
+
+	// Use filename to construct the path
+	path := fmt.Sprintf("documents/%d_%s", document.ID, filename)
+	if filename == "" {
+		path = fmt.Sprintf("documents/%d", document.ID)
+	}
+
+	return &MediaInfo{
+		Type:     "document",
+		MimeType: getMimeType(document),
+		Size:     document.Size,
+		FileID:   strconv.FormatInt(document.ID, 10), // Convert int64 to string
+		FileRef:  document.FileReference,
+		Path:     path,
+	}, nil
+}
+
+// Helper function to get MIME type from document
+func getMimeType(doc *tg.Document) string {
+	if doc.MimeType != "" {
+		return doc.MimeType
+	}
+	return "application/octet-stream"
+}
+
+// Add these functions to implement actual download logic
+func (h *MessageHandler) downloadPhoto(ctx context.Context, photo *tg.MessageMediaPhoto, size *tg.PhotoSize) ([]byte, error) {
+	// TODO: Implement photo download using your Telegram client
+	// This would involve:
+	// 1. Getting the input file location
+	// 2. Using getFile API to download the content
+	// 3. Returning the raw bytes
+	return nil, fmt.Errorf("photo download not implemented")
+}
+
+func (h *MessageHandler) downloadDocument(ctx context.Context, doc *tg.Document) ([]byte, error) {
+	// TODO: Implement document download using your Telegram client
+	// This would involve:
+	// 1. Getting the input file location
+	// 2. Using getFile API to download the content
+	// 3. Returning the raw bytes
+	return nil, fmt.Errorf("document download not implemented")
 }
