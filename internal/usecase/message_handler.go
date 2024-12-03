@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	batchSize      = 10
+	batchSize      = 10000
 	bucketName     = "dwarvesf-telegram"
 	basePath       = "messages"
 	mediaPath      = "media"
